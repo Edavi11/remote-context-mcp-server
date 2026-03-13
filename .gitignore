@@ -1,0 +1,32 @@
+
+# Cursor AI rules
+.cursor/rules/codacy.mdc
+
+# Build output
+dist/
+
+# Dependencies
+node_modules/
+
+# Coverage
+coverage/
+
+# Environment & credentials (never commit)
+.env
+.env.*
+
+# MCP / agent config (may contain SSH credentials)
+.mcp.json
+.agents/
+.claude/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TypeScript cache
+*.tsbuildinfo

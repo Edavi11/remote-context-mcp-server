@@ -1,0 +1,58 @@
+{
+  "name": "remote-context-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for SSH remote server management — connect to multiple remote servers via SSH, execute commands, and track long-running processes",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "remote-context-mcp-server": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "!dist/__tests__"
+  ],
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Edavi11/remote-context-mcp-server.git"
+  },
+  "homepage": "https://github.com/Edavi11/remote-context-mcp-server#readme",
+  "bugs": {
+    "url": "https://github.com/Edavi11/remote-context-mcp-server/issues"
+  },
+  "keywords": [
+    "mcp",
+    "ssh",
+    "remote",
+    "server",
+    "shell",
+    "command",
+    "devops"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "ssh2": "^1.17.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.5",
+    "@types/ssh2": "^1.15.5",
+    "@vitest/coverage-v8": "^4.0.18",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}
