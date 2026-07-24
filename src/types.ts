@@ -4,11 +4,14 @@ export interface SSHConnectionConfig {
   port?: number;
   username: string;
   password?: string;
+  passwordFile?: string;
   privateKeyPath?: string;
   passphrase?: string;
+  passphraseFile?: string;
+  allowedCommands?: string[];
 }
 
-export type ProcessStatus = 'running' | 'completed' | 'failed' | 'timeout' | 'blocked';
+export type ProcessStatus = 'running' | 'completed' | 'failed' | 'timeout' | 'blocked' | 'killed';
 
 export type AuthType = 'password' | 'key';
 

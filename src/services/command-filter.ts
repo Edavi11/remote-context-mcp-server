@@ -12,11 +12,20 @@ export interface FilterResult {
   severity?: Severity;
 }
 
+// This is a regex blocklist — defense in depth against obviously destructive
+// commands, not a security guarantee. It cannot catch every equivalent
+// (variable indirection, novel destructive tools, etc.). Connections handling
+// sensitive/production servers should also set `allowedCommands` on the
+// connection config to switch to an explicit allowlist.
 const BLOCKED_PATTERNS: BlockedPattern[] = [
   // Filesystem destruction — only block when targeting root (/) or system dirs directly
   { pattern: /rm\s+(-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*|-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*)\s+\/$/, severity: 'critical', reason: 'Recursive deletion from root filesystem' },
   { pattern: /rm\s+-rf\s+\/(\s|$)/, severity: 'critical', reason: 'Recursive deletion from root filesystem' },
   { pattern: /rm\s+-fr\s+\/(\s|$)/, severity: 'critical', reason: 'Recursive deletion from root filesystem' },
+  { pattern: /rm\s+(-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*|-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*)\s+\/\*/, severity: 'critical', reason: 'Recursive deletion of everything under root filesystem' },
+  { pattern: /rm\s+(-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*|-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*)\s+\/(home|etc|var|boot|usr|bin|lib32|lib64|lib|root|opt)\/?(\s|$)/, severity: 'critical', reason: 'Recursive deletion of a critical system directory' },
+  { pattern: /find\s+\/\s+.*-delete/, severity: 'critical', reason: 'Recursive deletion from root via find -delete' },
+  { pattern: /rmtree\(\s*['"]\/['"]/, severity: 'critical', reason: 'Recursive deletion of root filesystem via Python shutil.rmtree' },
   { pattern: /mkfs/, severity: 'critical', reason: 'Disk formatting command detected' },
   { pattern: /dd\s+.*of=\/dev\/[a-zA-Z]/, severity: 'critical', reason: 'Direct write to block device' },
   { pattern: /shred\s+.*\/dev\//, severity: 'critical', reason: 'Device destruction command detected' },
@@ -58,6 +67,37 @@ export function filterCommand(command: string): FilterResult {
     if (pattern.test(normalizedCommand)) {
       return { allowed: false, reason, severity };
     }
+  }
+
+  return { allowed: true };
+}
+
+/**
+ * When a connection defines `allowedCommands`, the command must match at least
+ * one of those patterns (anchored to the start) or it is rejected — inverting
+ * the default blocklist into an explicit allowlist for sensitive connections.
+ * Connections without `allowedCommands` are unaffected (returns allowed: true).
+ */
+export function checkAllowlist(command: string, allowedCommands?: string[]): FilterResult {
+  if (!allowedCommands || allowedCommands.length === 0) {
+    return { allowed: true };
+  }
+
+  const normalizedCommand = command.trim();
+  const matches = allowedCommands.some((pattern) => {
+    try {
+      return new RegExp(`^${pattern}`).test(normalizedCommand);
+    } catch {
+      return false;
+    }
+  });
+
+  if (!matches) {
+    return {
+      allowed: false,
+      severity: 'high',
+      reason: 'Command does not match this connection\'s allowedCommands allowlist',
+    };
   }
 
   return { allowed: true };

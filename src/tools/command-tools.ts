@@ -1,8 +1,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { connectionManager } from '../services/connection-manager.js';
-import { filterCommand } from '../services/command-filter.js';
+import { filterCommand, checkAllowlist } from '../services/command-filter.js';
 import { processTracker } from '../services/process-tracker.js';
+import { buildFullCommand } from '../services/shell-utils.js';
 
 export function registerCommandTools(server: McpServer): void {
   server.registerTool(
@@ -11,7 +12,7 @@ export function registerCommandTools(server: McpServer): void {
       title: 'Execute SSH Command',
       description: `Executes a shell command on a remote server via SSH.
 
-IMPORTANT: This tool will show the user the command being executed and ask for confirmation before running it. Dangerous commands are blocked automatically.
+IMPORTANT: Whether the user is prompted to confirm before this runs depends on the MCP client's settings (destructiveHint) — the server itself does not enforce confirmation. Dangerous commands are blocked automatically regardless of client settings.
 
 Use async=true for long-running commands (builds, migrations, log tailing, etc.) — the tool returns immediately with a process_id you can track with ssh_get_process.
 
@@ -22,12 +23,13 @@ Use async=false (default) for quick commands where you need the result immediate
         working_directory: z.string().optional().describe('Directory to run the command in (optional)'),
         timeout_seconds: z.number().int().min(1).max(3600).optional().default(30).describe('Seconds before the command is killed (default: 30, max: 3600)'),
         async: z.boolean().optional().default(false).describe('If true, returns immediately with a process_id without waiting for the command to finish'),
+        dry_run: z.boolean().optional().default(false).describe('If true, resolves and validates the command (including the blocklist/allowlist check) without connecting or executing anything'),
       },
       annotations: {
         destructiveHint: true,
       },
     },
-    async ({ connection_name, command, working_directory, timeout_seconds, async: isAsync }) => {
+    async ({ connection_name, command, working_directory, timeout_seconds, async: isAsync, dry_run }) => {
       // Validate connection exists
       const config = connectionManager.getConfig(connection_name);
       if (!config) {
@@ -42,15 +44,37 @@ Use async=false (default) for quick commands where you need the result immediate
         };
       }
 
-      // Filter dangerous commands
-      const filterResult = filterCommand(command);
-      if (!filterResult.allowed) {
+      // Filter dangerous commands — validate the fully assembled command (including
+      // the `cd` prefix from working_directory) so nothing can bypass the filter
+      // by smuggling shell operators through working_directory.
+      const fullCommand = buildFullCommand(command, working_directory);
+      const filterResult = filterCommand(fullCommand);
+      const verdict = filterResult.allowed ? checkAllowlist(command, config.allowedCommands) : filterResult;
+
+      if (dry_run) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: [
+                `Dry run — nothing was executed.`,
+                `Resolved command: ${fullCommand}`,
+                `Verdict: ${verdict.allowed ? 'ALLOWED' : `BLOCKED [${verdict.severity?.toUpperCase()}]`}`,
+                verdict.reason ? `Reason: ${verdict.reason}` : '',
+              ].filter(Boolean).join('\n'),
+            },
+          ],
+          isError: !verdict.allowed,
+        };
+      }
+
+      if (!verdict.allowed) {
         const blockedRecord = processTracker.createBlocked({
           connection_name,
           command,
           working_directory,
           timeout_seconds: timeout_seconds ?? 30,
-          blocked_reason: filterResult.reason!,
+          blocked_reason: verdict.reason!,
         });
 
         return {
@@ -58,8 +82,8 @@ Use async=false (default) for quick commands where you need the result immediate
             {
               type: 'text',
               text: [
-                `Command blocked [${filterResult.severity?.toUpperCase()}]`,
-                `Reason: ${filterResult.reason}`,
+                `Command blocked [${verdict.severity?.toUpperCase()}]`,
+                `Reason: ${verdict.reason}`,
                 `Command: ${command}`,
                 `Process ID: ${blockedRecord.id} (status: blocked)`,
               ].join('\n'),
@@ -127,7 +151,7 @@ Use async=false (default) for quick commands where you need the result immediate
 
       return {
         content: [{ type: 'text', text: lines.join('\n') }],
-        isError: record.status === 'failed' || record.status === 'timeout',
+        isError: record.status === 'failed' || record.status === 'timeout' || record.status === 'killed',
       };
     }
   );
@@ -192,7 +216,11 @@ Use async=false (default) for quick commands where you need the result immediate
 
       return {
         content: [{ type: 'text', text: lines.join('\n') }],
-        isError: record.status === 'failed' || record.status === 'timeout' || record.status === 'blocked',
+        isError:
+          record.status === 'failed' ||
+          record.status === 'timeout' ||
+          record.status === 'blocked' ||
+          record.status === 'killed',
       };
     }
   );
@@ -206,7 +234,7 @@ Use async=false (default) for quick commands where you need the result immediate
       inputSchema: {
         connection_name: z.string().optional().describe('Filter by connection name (optional)'),
         status: z
-          .enum(['running', 'completed', 'failed', 'timeout', 'blocked'])
+          .enum(['running', 'completed', 'failed', 'timeout', 'blocked', 'killed'])
           .optional()
           .describe('Filter by process status (optional)'),
       },
@@ -247,6 +275,55 @@ Use async=false (default) for quick commands where you need the result immediate
             text: JSON.stringify(processes, null, 2),
           },
         ],
+      };
+    }
+  );
+
+  server.registerTool(
+    'ssh_kill_process',
+    {
+      title: 'Kill SSH Process',
+      description:
+        'Cancels a running SSH command started with ssh_exec (typically one started with async=true). Sends a KILL signal to the remote process and closes the channel. Has no effect on processes that already finished.',
+      inputSchema: {
+        process_id: z.string().describe('The process ID returned by ssh_exec'),
+      },
+      annotations: {
+        destructiveHint: true,
+      },
+    },
+    async ({ process_id }) => {
+      const record = processTracker.get(process_id);
+      if (!record) {
+        return {
+          content: [{ type: 'text', text: `Process "${process_id}" not found.` }],
+          isError: true,
+        };
+      }
+
+      if (record.status !== 'running') {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Process "${process_id}" is not running (status: ${record.status}). Nothing to kill.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const killed = connectionManager.killProcess(process_id);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: killed
+              ? `Process "${process_id}" was killed.`
+              : `Could not kill process "${process_id}" — no active stream found for it.`,
+          },
+        ],
+        isError: !killed,
       };
     }
   );

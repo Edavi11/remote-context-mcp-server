@@ -6,11 +6,14 @@ export const SSHConnectionConfigSchema = z.object({
   port: z.number().int().min(1).max(65535).optional().default(22),
   username: z.string().min(1, 'Username is required'),
   password: z.string().optional(),
+  passwordFile: z.string().optional(),
   privateKeyPath: z.string().optional(),
   passphrase: z.string().optional(),
+  passphraseFile: z.string().optional(),
+  allowedCommands: z.array(z.string()).optional(),
 }).refine(
-  (data) => data.password !== undefined || data.privateKeyPath !== undefined,
-  { message: 'Either password or privateKeyPath must be provided' }
+  (data) => data.password !== undefined || data.passwordFile !== undefined || data.privateKeyPath !== undefined,
+  { message: 'Either password, passwordFile, or privateKeyPath must be provided' }
 );
 
 export const SSHConnectionsEnvSchema = z.array(SSHConnectionConfigSchema).min(1, 'At least one SSH connection is required');
@@ -33,5 +36,9 @@ export const SshGetProcessInputSchema = z.object({
 
 export const SshListProcessesInputSchema = z.object({
   connection_name: z.string().optional(),
-  status: z.enum(['running', 'completed', 'failed', 'timeout', 'blocked']).optional(),
+  status: z.enum(['running', 'completed', 'failed', 'timeout', 'blocked', 'killed']).optional(),
+});
+
+export const SshKillProcessInputSchema = z.object({
+  process_id: z.string().min(1, 'Process ID is required'),
 });

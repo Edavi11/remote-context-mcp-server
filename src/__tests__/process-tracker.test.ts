@@ -147,4 +147,55 @@ describe('processTracker', () => {
       expect(completed.find((p) => p.id === r.id)).toBeDefined();
     });
   });
+
+  describe('output size limit', () => {
+    it('truncates stdout once MAX_OUTPUT_BYTES is exceeded', () => {
+      const record = processTracker.create(baseParams);
+      const chunk = 'x'.repeat(200_000);
+      // Default MAX_OUTPUT_BYTES is 1_000_000; 6 chunks exceeds it.
+      for (let i = 0; i < 6; i++) {
+        processTracker.appendStdout(record.id, chunk);
+      }
+      const updated = processTracker.get(record.id);
+      expect(updated?.stdout.length).toBeLessThan(1_100_000);
+      expect(updated?.stdout).toContain('[...output truncated');
+    });
+
+    it('stops growing after truncation even with more data', () => {
+      const record = processTracker.create(baseParams);
+      const chunk = 'x'.repeat(1_100_000);
+      processTracker.appendStdout(record.id, chunk);
+      const sizeAfterFirst = processTracker.get(record.id)?.stdout.length ?? 0;
+      processTracker.appendStdout(record.id, 'more data');
+      const sizeAfterSecond = processTracker.get(record.id)?.stdout.length ?? 0;
+      expect(sizeAfterSecond).toBe(sizeAfterFirst);
+    });
+  });
+
+  describe('record eviction', () => {
+    it('evicts oldest non-running records once MAX_RECORDS is exceeded', () => {
+      const first = processTracker.create({ ...baseParams, connection_name: 'eviction-test' });
+      processTracker.complete(first.id, 0);
+
+      // Default MAX_RECORDS is 500; creating well beyond that forces eviction.
+      for (let i = 0; i < 600; i++) {
+        const r = processTracker.create({ ...baseParams, connection_name: 'eviction-test' });
+        processTracker.complete(r.id, 0);
+      }
+
+      expect(processTracker.get(first.id)).toBeUndefined();
+    });
+
+    it('never evicts a running process', () => {
+      const running = processTracker.create({ ...baseParams, connection_name: 'eviction-running-test' });
+
+      for (let i = 0; i < 600; i++) {
+        const r = processTracker.create({ ...baseParams, connection_name: 'eviction-running-test' });
+        processTracker.complete(r.id, 0);
+      }
+
+      expect(processTracker.get(running.id)).toBeDefined();
+      expect(processTracker.get(running.id)?.status).toBe('running');
+    });
+  });
 });

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { filterCommand } from '../services/command-filter.js';
+import { filterCommand, checkAllowlist } from '../services/command-filter.js';
+import { buildFullCommand } from '../services/shell-utils.js';
 
 describe('filterCommand', () => {
   describe('allowed commands', () => {
@@ -81,6 +82,35 @@ describe('filterCommand', () => {
       expect(result.allowed).toBe(false);
       expect(result.severity).toBe('critical');
     });
+
+    it('blocks rm -rf /* (glob wildcard under root)', () => {
+      const result = filterCommand('rm -rf /*');
+      expect(result.allowed).toBe(false);
+      expect(result.severity).toBe('critical');
+    });
+
+    it('blocks rm -rf on a bare critical directory', () => {
+      expect(filterCommand('rm -rf /home').allowed).toBe(false);
+      expect(filterCommand('rm -rf /etc/').allowed).toBe(false);
+      expect(filterCommand('rm -rf /var').allowed).toBe(false);
+    });
+
+    it('still allows rm -rf on a subdirectory of a critical directory', () => {
+      expect(filterCommand('rm -rf /home/user/temp').allowed).toBe(true);
+      expect(filterCommand('rm -rf /var/log/myapp').allowed).toBe(true);
+    });
+
+    it('blocks find / -delete', () => {
+      const result = filterCommand('find / -type f -delete');
+      expect(result.allowed).toBe(false);
+      expect(result.severity).toBe('critical');
+    });
+
+    it('blocks python shutil.rmtree on root', () => {
+      const result = filterCommand(`python3 -c "import shutil; shutil.rmtree('/')"`);
+      expect(result.allowed).toBe(false);
+      expect(result.severity).toBe('critical');
+    });
   });
 
   describe('blocked commands — high', () => {
@@ -148,6 +178,45 @@ describe('filterCommand', () => {
       const result = filterCommand('init 0');
       expect(result.allowed).toBe(false);
       expect(result.severity).toBe('high');
+    });
+  });
+
+  describe('working_directory injection is caught once assembled', () => {
+    it('blocks a dangerous command smuggled through working_directory', () => {
+      const fullCommand = buildFullCommand('ls', '/tmp && rm -rf / #');
+      const result = filterCommand(fullCommand);
+      expect(result.allowed).toBe(false);
+      expect(result.severity).toBe('critical');
+    });
+
+    it('still allows a benign working_directory', () => {
+      const fullCommand = buildFullCommand('ls -la', '/var/www');
+      expect(filterCommand(fullCommand).allowed).toBe(true);
+    });
+  });
+
+  describe('checkAllowlist', () => {
+    it('allows anything when no allowlist is configured', () => {
+      expect(checkAllowlist('rm -rf /tmp/x').allowed).toBe(true);
+      expect(checkAllowlist('anything', undefined).allowed).toBe(true);
+      expect(checkAllowlist('anything', []).allowed).toBe(true);
+    });
+
+    it('allows a command matching one of the allowed patterns', () => {
+      const result = checkAllowlist('systemctl status nginx', ['systemctl status', 'df ', 'ls']);
+      expect(result.allowed).toBe(true);
+    });
+
+    it('blocks a command not matching any allowed pattern', () => {
+      const result = checkAllowlist('rm -rf /var/log', ['systemctl status', 'df ']);
+      expect(result.allowed).toBe(false);
+      expect(result.severity).toBe('high');
+    });
+
+    it('anchors patterns to the start of the command', () => {
+      // "df " should not match a command that merely contains "df " later on
+      const result = checkAllowlist('echo df ', ['df ']);
+      expect(result.allowed).toBe(false);
     });
   });
 

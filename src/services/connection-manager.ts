@@ -1,12 +1,15 @@
-import { Client, ConnectConfig } from 'ssh2';
+import { Client, ClientChannel, ConnectConfig } from 'ssh2';
 import fs from 'fs';
 import { SSHConnectionConfig, ConnectionMeta, AuthType, ExecOptions } from '../types.js';
 import { SSHConnectionsEnvSchema } from '../schemas/connection.js';
 import { processTracker } from './process-tracker.js';
+import { buildFullCommand } from './shell-utils.js';
+import { knownHostsStore } from './known-hosts.js';
 
 export interface ExecCallbacks {
   onStdout?: (data: string) => void;
   onStderr?: (data: string) => void;
+  onStream?: (stream: ClientChannel) => void;
 }
 
 export interface RawExecResult {
@@ -15,8 +18,18 @@ export interface RawExecResult {
   exit_code: number;
 }
 
+interface PooledClient {
+  client: Client;
+  idleTimer?: ReturnType<typeof setTimeout>;
+}
+
+const POOL_IDLE_MS = Number(process.env.SSH_POOL_IDLE_MS) || 5 * 60 * 1000;
+
 class ConnectionManager {
   private configs = new Map<string, SSHConnectionConfig>();
+  private pool = new Map<string, PooledClient>();
+  private connecting = new Map<string, Promise<Client>>();
+  private activeStreams = new Map<string, ClientChannel>();
 
   constructor() {
     this.loadFromEnv();
@@ -55,28 +68,139 @@ class ConnectionManager {
   }
 
   private buildConnectConfig(config: SSHConnectionConfig): ConnectConfig {
+    const host = config.host;
+    const port = config.port ?? 22;
+
     const base: ConnectConfig = {
-      host: config.host,
-      port: config.port ?? 22,
+      host,
+      port,
       username: config.username,
       readyTimeout: 10000,
+      hostHash: 'sha256',
+      hostVerifier: (fingerprint: string) => {
+        const result = knownHostsStore.verify(host, port, fingerprint);
+        if (result === 'mismatch') {
+          console.error(
+            `[remote-context] HOST KEY MISMATCH for ${host}:${port} — refusing to connect. ` +
+              'This could mean the server was reconfigured, or a man-in-the-middle attack. ' +
+              `If this is expected, remove the stale entry from the known_hosts store.`
+          );
+          return false;
+        }
+        return true;
+      },
     };
 
     if (config.privateKeyPath) {
       try {
         const keyContent = fs.readFileSync(config.privateKeyPath, 'utf-8');
         base.privateKey = keyContent;
-        if (config.passphrase) {
-          base.passphrase = config.passphrase;
-        }
       } catch (err) {
         throw new Error(`Cannot read private key at "${config.privateKeyPath}": ${(err as Error).message}`);
       }
-    } else if (config.password) {
-      base.password = config.password;
+
+      const passphrase = this.readSecret('passphrase', config.passphrase, config.passphraseFile);
+      if (passphrase) {
+        base.passphrase = passphrase;
+      }
+    } else {
+      const password = this.readSecret('password', config.password, config.passwordFile);
+      if (password) {
+        base.password = password;
+      }
     }
 
     return base;
+  }
+
+  /** Reads a secret from an inline value or, preferably, a file (kept outside SSH_CONNECTIONS/env). */
+  private readSecret(label: string, inlineValue?: string, filePath?: string): string | undefined {
+    if (filePath) {
+      try {
+        return fs.readFileSync(filePath, 'utf-8').trim();
+      } catch (err) {
+        throw new Error(`Cannot read ${label} file at "${filePath}": ${(err as Error).message}`);
+      }
+    }
+    return inlineValue;
+  }
+
+  private resetIdleTimer(name: string, entry: PooledClient): void {
+    if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    entry.idleTimer = setTimeout(() => {
+      entry.client.end();
+      this.pool.delete(name);
+    }, POOL_IDLE_MS);
+    entry.idleTimer.unref?.();
+  }
+
+  private removeFromPool(name: string, client: Client): void {
+    const entry = this.pool.get(name);
+    if (entry && entry.client === client) {
+      if (entry.idleTimer) clearTimeout(entry.idleTimer);
+      this.pool.delete(name);
+    }
+  }
+
+  private getClient(name: string, config: SSHConnectionConfig): Promise<Client> {
+    const pooled = this.pool.get(name);
+    if (pooled) {
+      this.resetIdleTimer(name, pooled);
+      return Promise.resolve(pooled.client);
+    }
+
+    const inFlight = this.connecting.get(name);
+    if (inFlight) return inFlight;
+
+    const connectPromise = new Promise<Client>((resolve, reject) => {
+      const client = new Client();
+
+      const onError = (err: Error) => {
+        this.connecting.delete(name);
+        reject(err);
+      };
+
+      client.once('ready', () => {
+        client.removeListener('error', onError);
+        this.connecting.delete(name);
+
+        const entry: PooledClient = { client };
+        this.pool.set(name, entry);
+        this.resetIdleTimer(name, entry);
+
+        client.on('close', () => this.removeFromPool(name, client));
+        client.on('error', () => this.removeFromPool(name, client));
+
+        resolve(client);
+      });
+
+      client.once('error', onError);
+
+      try {
+        client.connect(this.buildConnectConfig(config));
+      } catch (err) {
+        onError(err as Error);
+      }
+    });
+
+    this.connecting.set(name, connectPromise);
+    return connectPromise;
+  }
+
+  /** Best-effort cancellation of a running remote process by its tracked process_id. */
+  killProcess(process_id: string): boolean {
+    const stream = this.activeStreams.get(process_id);
+    if (!stream) return false;
+
+    this.activeStreams.delete(process_id);
+    processTracker.kill(process_id);
+    try {
+      stream.signal('KILL');
+    } catch {
+      // Not all servers support the signal extension — closing the channel below still cuts it off locally.
+    }
+    stream.close();
+    return true;
   }
 
   listConnections(): ConnectionMeta[] {
@@ -93,45 +217,45 @@ class ConnectionManager {
     return this.configs.get(name);
   }
 
-  ping(name: string): Promise<{ success: boolean; latency_ms: number; server_info: string }> {
+  /** Returns a ready, pooled ssh2 Client for the given connection — used by services (e.g. SFTP) that need direct access. */
+  getReadyClient(name: string): Promise<Client> {
     const config = this.configs.get(name);
     if (!config) {
-      return Promise.resolve({ success: false, latency_ms: 0, server_info: `Connection "${name}" not found` });
+      return Promise.reject(new Error(`Connection "${name}" not found`));
+    }
+    return this.getClient(name, config);
+  }
+
+  async ping(name: string): Promise<{ success: boolean; latency_ms: number; server_info: string }> {
+    const config = this.configs.get(name);
+    if (!config) {
+      return { success: false, latency_ms: 0, server_info: `Connection "${name}" not found` };
     }
 
+    const startTime = Date.now();
+
+    let client: Client;
+    try {
+      client = await this.getClient(name, config);
+    } catch (err) {
+      return { success: false, latency_ms: Date.now() - startTime, server_info: (err as Error).message };
+    }
+
+    const latency_ms = Date.now() - startTime;
+
     return new Promise((resolve) => {
-      const client = new Client();
-      const startTime = Date.now();
-
-      const onError = (err: Error) => {
-        resolve({ success: false, latency_ms: Date.now() - startTime, server_info: err.message });
-      };
-
-      client.on('ready', () => {
-        const latency_ms = Date.now() - startTime;
-        client.exec('uname -a', (err, stream) => {
-          if (err) {
-            client.end();
-            resolve({ success: true, latency_ms, server_info: 'Connected (could not fetch server info)' });
-            return;
-          }
-          let info = '';
-          stream.on('data', (d: Buffer) => { info += d.toString(); });
-          stream.stderr.on('data', (_d: Buffer) => {});
-          stream.on('close', () => {
-            client.end();
-            resolve({ success: true, latency_ms, server_info: info.trim() });
-          });
+      client.exec('uname -a', (err, stream) => {
+        if (err) {
+          resolve({ success: true, latency_ms, server_info: 'Connected (could not fetch server info)' });
+          return;
+        }
+        let info = '';
+        stream.on('data', (d: Buffer) => { info += d.toString(); });
+        stream.stderr.on('data', (_d: Buffer) => {});
+        stream.on('close', () => {
+          resolve({ success: true, latency_ms, server_info: info.trim() });
         });
       });
-
-      client.on('error', onError);
-
-      try {
-        client.connect(this.buildConnectConfig(config));
-      } catch (err) {
-        resolve({ success: false, latency_ms: Date.now() - startTime, server_info: (err as Error).message });
-      }
     });
   }
 
@@ -147,12 +271,9 @@ class ConnectionManager {
     }
 
     const timeout_seconds = options.timeout_seconds ?? 30;
-    const fullCommand = options.working_directory
-      ? `cd ${options.working_directory} && ${command}`
-      : command;
+    const fullCommand = buildFullCommand(command, options.working_directory);
 
     return new Promise((resolve, reject) => {
-      const client = new Client();
       let stdout = '';
       let stderr = '';
       let settled = false;
@@ -166,48 +287,39 @@ class ConnectionManager {
         }
       };
 
-      client.on('ready', () => {
-        client.exec(fullCommand, (err, stream) => {
-          if (err) {
-            client.end();
-            settle(() => reject(err));
-            return;
-          }
+      this.getClient(name, config)
+        .then((client) => {
+          client.exec(fullCommand, (err, stream) => {
+            if (err) {
+              settle(() => reject(err));
+              return;
+            }
 
-          timeoutHandle = setTimeout(() => {
-            stream.destroy();
-            client.end();
-            settle(() => reject(new Error('TIMEOUT')));
-          }, timeout_seconds * 1000);
+            callbacks.onStream?.(stream);
 
-          stream.on('data', (data: Buffer) => {
-            const chunk = data.toString();
-            stdout += chunk;
-            callbacks.onStdout?.(chunk);
+            timeoutHandle = setTimeout(() => {
+              stream.destroy();
+              settle(() => reject(new Error('TIMEOUT')));
+            }, timeout_seconds * 1000);
+
+            stream.on('data', (data: Buffer) => {
+              const chunk = data.toString();
+              stdout += chunk;
+              callbacks.onStdout?.(chunk);
+            });
+
+            stream.stderr.on('data', (data: Buffer) => {
+              const chunk = data.toString();
+              stderr += chunk;
+              callbacks.onStderr?.(chunk);
+            });
+
+            stream.on('close', (code: number | null) => {
+              settle(() => resolve({ stdout, stderr, exit_code: code ?? 0 }));
+            });
           });
-
-          stream.stderr.on('data', (data: Buffer) => {
-            const chunk = data.toString();
-            stderr += chunk;
-            callbacks.onStderr?.(chunk);
-          });
-
-          stream.on('close', (code: number | null) => {
-            client.end();
-            settle(() => resolve({ stdout, stderr, exit_code: code ?? 0 }));
-          });
-        });
-      });
-
-      client.on('error', (err) => {
-        settle(() => reject(err));
-      });
-
-      try {
-        client.connect(this.buildConnectConfig(config));
-      } catch (err) {
-        settle(() => reject(err));
-      }
+        })
+        .catch((err) => settle(() => reject(err)));
     });
   }
 
@@ -230,9 +342,12 @@ class ConnectionManager {
         const result = await this.exec(name, command, options, {
           onStdout: (data) => processTracker.appendStdout(record.id, data),
           onStderr: (data) => processTracker.appendStderr(record.id, data),
+          onStream: (stream) => this.activeStreams.set(record.id, stream),
         });
+        this.activeStreams.delete(record.id);
         processTracker.complete(record.id, result.exit_code);
       } catch (err) {
+        this.activeStreams.delete(record.id);
         const message = (err as Error).message;
         if (message === 'TIMEOUT') {
           processTracker.timeout(record.id);
