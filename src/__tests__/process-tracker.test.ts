@@ -170,6 +170,32 @@ describe('processTracker', () => {
       const sizeAfterSecond = processTracker.get(record.id)?.stdout.length ?? 0;
       expect(sizeAfterSecond).toBe(sizeAfterFirst);
     });
+
+    it('keeps capturing stderr after stdout was truncated', () => {
+      const record = processTracker.create(baseParams);
+      processTracker.appendStdout(record.id, 'x'.repeat(1_100_000));
+      processTracker.appendStderr(record.id, 'real error');
+      expect(processTracker.get(record.id)?.stderr).toBe('real error');
+    });
+
+    it('limits by bytes, not characters', () => {
+      const record = processTracker.create(baseParams);
+      // 'é' is 2 bytes in UTF-8: 600k chars = 1.2MB, over the 1MB limit.
+      processTracker.appendStdout(record.id, 'é'.repeat(600_000));
+      const stdout = processTracker.get(record.id)?.stdout ?? '';
+      expect(stdout).toContain('[...output truncated');
+      expect(Buffer.byteLength(stdout)).toBeLessThan(1_100_000);
+    });
+  });
+
+  describe('missing exit status', () => {
+    it('treats a null exit code (signal / dropped connection) as failed, never completed', () => {
+      const record = processTracker.create(baseParams);
+      const done = processTracker.complete(record.id, null, 'SIGKILL');
+      expect(done?.status).toBe('failed');
+      expect(done?.exit_code).toBeUndefined();
+      expect(done?.signal).toBe('SIGKILL');
+    });
   });
 
   describe('record eviction', () => {

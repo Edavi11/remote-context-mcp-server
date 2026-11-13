@@ -72,11 +72,15 @@ export function filterCommand(command: string): FilterResult {
   return { allowed: true };
 }
 
+// Chaining, substitution, redirection or a second line would let an allowed
+// prefix smuggle in an arbitrary command, so they're rejected outright.
+const SHELL_METACHARS = /[;&|`$<>\n\r]/;
+
 /**
- * When a connection defines `allowedCommands`, the command must match at least
- * one of those patterns (anchored to the start) or it is rejected — inverting
- * the default blocklist into an explicit allowlist for sensitive connections.
- * Connections without `allowedCommands` are unaffected (returns allowed: true).
+ * When a connection defines `allowedCommands`, the whole command must match one
+ * of those regex patterns (anchored at both ends) and contain no shell
+ * operators — inverting the default blocklist into an explicit allowlist for
+ * sensitive connections. Connections without `allowedCommands` are unaffected.
  */
 export function checkAllowlist(command: string, allowedCommands?: string[]): FilterResult {
   if (!allowedCommands || allowedCommands.length === 0) {
@@ -84,9 +88,17 @@ export function checkAllowlist(command: string, allowedCommands?: string[]): Fil
   }
 
   const normalizedCommand = command.trim();
+  if (SHELL_METACHARS.test(normalizedCommand)) {
+    return {
+      allowed: false,
+      severity: 'high',
+      reason: 'Shell operators (; & | ` $ < > or newlines) are not allowed on connections with an allowedCommands allowlist',
+    };
+  }
+
   const matches = allowedCommands.some((pattern) => {
     try {
-      return new RegExp(`^${pattern}`).test(normalizedCommand);
+      return new RegExp(`^(?:${pattern})$`).test(normalizedCommand);
     } catch {
       return false;
     }

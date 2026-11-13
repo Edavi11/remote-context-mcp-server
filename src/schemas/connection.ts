@@ -1,7 +1,16 @@
 import { z } from 'zod';
 
+function isValidRegex(pattern: string): boolean {
+  try {
+    new RegExp(pattern);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export const SSHConnectionConfigSchema = z.object({
-  name: z.string().min(1, 'Connection name is required'),
+  name: z.string().regex(/^[a-zA-Z0-9._-]+$/, 'Connection name must only contain letters, numbers, dots, hyphens or underscores'),
   host: z.string().min(1, 'Host is required'),
   port: z.number().int().min(1).max(65535).optional().default(22),
   username: z.string().min(1, 'Username is required'),
@@ -10,35 +19,23 @@ export const SSHConnectionConfigSchema = z.object({
   privateKeyPath: z.string().optional(),
   passphrase: z.string().optional(),
   passphraseFile: z.string().optional(),
-  allowedCommands: z.array(z.string()).optional(),
+  allowedCommands: z.array(z.string().refine(isValidRegex, 'allowedCommands entries must be valid regular expressions')).optional(),
+  remoteRoots: z.array(z.string().min(1)).optional(),
+  localRoots: z.array(z.string().min(1)).optional(),
 }).refine(
   (data) => data.password !== undefined || data.passwordFile !== undefined || data.privateKeyPath !== undefined,
   { message: 'Either password, passwordFile, or privateKeyPath must be provided' }
 );
 
-export const SSHConnectionsEnvSchema = z.array(SSHConnectionConfigSchema).min(1, 'At least one SSH connection is required');
-
-export const SshExecInputSchema = z.object({
-  connection_name: z.string().min(1, 'Connection name is required'),
-  command: z.string().min(1, 'Command is required'),
-  working_directory: z.string().optional(),
-  timeout_seconds: z.number().int().min(1).max(3600).optional().default(30),
-  async: z.boolean().optional().default(false),
-});
-
-export const SshPingInputSchema = z.object({
-  connection_name: z.string().min(1, 'Connection name is required'),
-});
-
-export const SshGetProcessInputSchema = z.object({
-  process_id: z.string().min(1, 'Process ID is required'),
-});
-
-export const SshListProcessesInputSchema = z.object({
-  connection_name: z.string().optional(),
-  status: z.enum(['running', 'completed', 'failed', 'timeout', 'blocked', 'killed']).optional(),
-});
-
-export const SshKillProcessInputSchema = z.object({
-  process_id: z.string().min(1, 'Process ID is required'),
-});
+export const SSHConnectionsSchema = z
+  .array(SSHConnectionConfigSchema)
+  .min(1, 'At least one SSH connection is required')
+  .superRefine((connections, ctx) => {
+    const seen = new Set<string>();
+    connections.forEach((c, i) => {
+      if (seen.has(c.name)) {
+        ctx.addIssue({ code: 'custom', path: [i, 'name'], message: `Duplicate connection name "${c.name}"` });
+      }
+      seen.add(c.name);
+    });
+  });

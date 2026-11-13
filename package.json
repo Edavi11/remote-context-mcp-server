@@ -1,7 +1,7 @@
 {
   "name": "remote-context-mcp-server",
-  "version": "1.1.0",
-  "description": "MCP server for SSH remote server management — connect to multiple remote servers via SSH, execute commands, and track long-running processes",
+  "version": "2.0.0",
+  "description": "MCP server for SSH remote server management — connect to multiple remote servers via SSH, execute commands, transfer files over SFTP, and track long-running processes",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -22,7 +22,7 @@
     "prepublishOnly": "npm run build"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "repository": {
     "type": "git",
@@ -39,7 +39,8 @@
     "server",
     "shell",
     "command",
-    "devops"
+    "devops",
+    "sftp"
   ],
   "license": "MIT",
   "dependencies": {
@@ -54,5 +55,8 @@
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
+  },
+  "overrides": {
+    "esbuild": "^0.28.2"
   }
 }

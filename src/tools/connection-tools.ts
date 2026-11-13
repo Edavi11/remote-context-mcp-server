@@ -17,30 +17,18 @@ export function registerConnectionTools(server: McpServer): void {
     async () => {
       const connections = connectionManager.listConnections();
 
-      if (connections.length === 0) {
+      if (connectionManager.configError) {
         return {
-          content: [
-            {
-              type: 'text',
-              text: 'No SSH connections configured. Set the SSH_CONNECTIONS environment variable with a JSON array of connection configs.',
-            },
-          ],
+          content: [{ type: 'text', text: `No SSH connections available.\n${connectionManager.configError}` }],
+          isError: true,
         };
       }
-
-      const rows = connections.map((c) => ({
-        name: c.name,
-        host: c.host,
-        port: c.port,
-        username: c.username,
-        auth_type: c.auth_type,
-      }));
 
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(rows, null, 2),
+            text: JSON.stringify({ source: connectionManager.configSource, connections }, null, 2),
           },
         ],
       };

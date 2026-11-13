@@ -13,23 +13,24 @@ const TRUNCATION_NOTICE = '\n[...output truncated, limit reached...]';
 
 class ProcessTracker {
   private records = new Map<string, ProcessRecord>();
-  private truncated = new Set<string>();
+  /** Bytes appended so far, keyed by `${id}:stdout` / `${id}:stderr`. */
+  private usedBytes = new Map<string, number>();
 
   private appendBounded(record: ProcessRecord, field: 'stdout' | 'stderr', data: string): void {
-    if (this.truncated.has(record.id)) return;
+    const key = `${record.id}:${field}`;
+    const used = this.usedBytes.get(key) ?? 0;
+    if (used >= MAX_OUTPUT_BYTES) return;
 
-    const remaining = MAX_OUTPUT_BYTES - record[field].length;
-    if (remaining <= 0) {
-      record[field] += TRUNCATION_NOTICE;
-      this.truncated.add(record.id);
+    const buf = Buffer.from(data, 'utf-8');
+    const remaining = MAX_OUTPUT_BYTES - used;
+    if (buf.length < remaining) {
+      record[field] += data;
+      this.usedBytes.set(key, used + buf.length);
       return;
     }
 
-    record[field] += data.length > remaining ? data.slice(0, remaining) : data;
-    if (data.length > remaining) {
-      record[field] += TRUNCATION_NOTICE;
-      this.truncated.add(record.id);
-    }
+    record[field] += buf.subarray(0, remaining).toString('utf-8') + TRUNCATION_NOTICE;
+    this.usedBytes.set(key, MAX_OUTPUT_BYTES);
   }
 
   private evictIfNeeded(): void {
@@ -39,7 +40,8 @@ class ProcessTracker {
       if (this.records.size <= MAX_RECORDS) break;
       if (record.status === 'running') continue;
       this.records.delete(id);
-      this.truncated.delete(id);
+      this.usedBytes.delete(`${id}:stdout`);
+      this.usedBytes.delete(`${id}:stderr`);
     }
   }
 
@@ -110,7 +112,11 @@ class ProcessTracker {
     }
   }
 
-  complete(id: string, exit_code: number): ProcessRecord | undefined {
+  /**
+   * `exit_code: null` means the remote side never reported an exit status
+   * (killed by a signal, or the connection dropped) — that's a failure, never success.
+   */
+  complete(id: string, exit_code: number | null, signal?: string): ProcessRecord | undefined {
     const record = this.records.get(id);
     if (!record) return undefined;
     // A kill() already finalized this record — don't let a late exec() resolution overwrite it.
@@ -122,7 +128,8 @@ class ProcessTracker {
     record.status = exit_code === 0 ? 'completed' : 'failed';
     record.finished_at = finished_at;
     record.duration_ms = duration_ms;
-    record.exit_code = exit_code;
+    record.exit_code = exit_code ?? undefined;
+    record.signal = signal;
 
     auditLog.record(record.status, record);
     return record;

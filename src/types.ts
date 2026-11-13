@@ -9,6 +9,8 @@ export interface SSHConnectionConfig {
   passphrase?: string;
   passphraseFile?: string;
   allowedCommands?: string[];
+  remoteRoots?: string[];
+  localRoots?: string[];
 }
 
 export type ProcessStatus = 'running' | 'completed' | 'failed' | 'timeout' | 'blocked' | 'killed';
@@ -27,6 +29,7 @@ export interface ProcessRecord {
   stdout: string;
   stderr: string;
   exit_code?: number;
+  signal?: string;
   timeout_seconds: number;
   blocked_reason?: string;
 }
@@ -37,20 +40,13 @@ export interface ConnectionMeta {
   port: number;
   username: string;
   auth_type: AuthType;
+  restricted: boolean;
+  remote_roots?: string[];
+  local_roots?: string[];
 }
 
 export interface ExecOptions {
   working_directory?: string;
   timeout_seconds?: number;
   async?: boolean;
-}
-
-export interface ExecResult {
-  process_id: string;
-  status: ProcessStatus;
-  stdout?: string;
-  stderr?: string;
-  exit_code?: number;
-  duration_ms?: number;
-  message?: string;
 }
